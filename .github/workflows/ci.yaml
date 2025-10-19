@@ -32,15 +32,15 @@ jobs:
           set -euxo pipefail
           echo "Using DOMAIN=${DOMAIN}"
           echo "Using HOSTNAME_FQDN=${HOSTNAME_FQDN}"
-
+      
           sudo debconf-set-selections <<EOF
           postfix postfix/mailname string ${DOMAIN}
           postfix postfix/main_mailer_type select Internet Site
           EOF
-
+      
           sudo apt-get update
           sudo apt-get install -y postfix mailutils ca-certificates netcat-openbsd rsyslog opendkim opendkim-tools
-
+      
           # Postfix: direct MX on port 25
           sudo postconf -e "myhostname = ${HOSTNAME_FQDN}"
           sudo postconf -e "myorigin = ${DOMAIN}"
@@ -56,7 +56,7 @@ jobs:
           sudo postconf -e "smtp_tls_loglevel = 1"
           sudo postconf -e "smtp_tls_CAfile = /etc/ssl/certs/ca-certificates.crt"
           sudo postconf -e "smtp_helo_name = ${HOSTNAME_FQDN}"
-
+      
           # Enable mail logs
           if ! grep -q "Postfix mail logs" /etc/rsyslog.d/50-default.conf; then
             sudo bash -c 'cat >>/etc/rsyslog.d/50-default.conf' <<'EOF'
@@ -67,23 +67,20 @@ jobs:
           EOF
           fi
           sudo service rsyslog restart || sudo service rsyslog start || true
-
-          # DKIM keypair (selector from env)
+      
+          # DKIM keypair
           sudo mkdir -p "/etc/opendkim/keys/${DOMAIN}"
           pushd "/etc/opendkim/keys/${DOMAIN}"
           sudo opendkim-genkey -s "${DKIM_SELECTOR}" -d "${DOMAIN}"
           sudo chown opendkim:opendkim "${DKIM_SELECTOR}.private"
-          # allow non-root to read the public TXT; keep private key tight
           sudo chmod 600 "${DKIM_SELECTOR}.private"
           sudo chmod 644 "${DKIM_SELECTOR}.txt"
-
-          # Extract public key (p=) safely with sudo and sanitize
+          # Extract DKIM p=
           DKIM_P="$(sudo awk -F 'p=' '/p=/{print $2}' "${DKIM_SELECTOR}.txt" | tr -d '\";[:space:]')"
-          # stash for later step (source /tmp/dkim_env)
           echo "DKIM_P=${DKIM_P}" | sudo tee /tmp/dkim_env >/dev/null
           popd
-
-          # Hook OpenDKIM into Postfix
+      
+          # OpenDKIM config
           sudo bash -c 'cat >/etc/opendkim.conf' <<'EOF'
           Syslog                  yes
           UMask                   002
@@ -99,18 +96,38 @@ jobs:
           ExternalIgnoreList      /etc/opendkim/TrustedHosts
           InternalHosts           /etc/opendkim/TrustedHosts
           EOF
-
+          # ensure opendkim user in conf
+          sudo sed -i '1iUserID                 opendkim' /etc/opendkim.conf
+      
           echo "${DKIM_SELECTOR}._domainkey.${DOMAIN} ${DOMAIN}:${DKIM_SELECTOR}:/etc/opendkim/keys/${DOMAIN}/${DKIM_SELECTOR}.private" | sudo tee /etc/opendkim/KeyTable
           echo "*@${DOMAIN} ${DKIM_SELECTOR}._domainkey.${DOMAIN}" | sudo tee /etc/opendkim/SigningTable
           printf "127.0.0.1\n::1\nlocalhost\n" | sudo tee /etc/opendkim/TrustedHosts
-
-          sudo postconf -e "milter_default_action = accept"
-          sudo postconf -e "milter_protocol = 6"
-          sudo postconf -e "smtpd_milters = inet:127.0.0.1:8891"
-          sudo postconf -e "non_smtpd_milters = inet:127.0.0.1:8891"
-
+      
+          # Service defaults: align socket with our conf
+          sudo bash -c 'cat >/etc/default/opendkim' <<'EOF'
+          RUNDIR=/var/run/opendkim
+          SOCKET=inet:8891@127.0.0.1
+          USER=opendkim
+          GROUP=opendkim
+          PIDFILE=$RUNDIR/opendkim.pid
+          EXTRAAFTER=
+          EOF
+          sudo mkdir -p /var/run/opendkim
+          sudo chown opendkim:opendkim /var/run/opendkim
+      
+          # Permissions so opendkim can read everything it needs
+          sudo chown -R opendkim:opendkim /etc/opendkim
+          sudo chmod 750 /etc/opendkim/keys
+          sudo chmod 600 /etc/opendkim/keys/${DOMAIN}/${DKIM_SELECTOR}.private
+          sudo chmod 644 /etc/opendkim/KeyTable /etc/opendkim/SigningTable /etc/opendkim/TrustedHosts
+      
+          # Validate config before starting (non-daemon)
+          sudo opendkim -x /etc/opendkim.conf -n
+      
+          # Start services
           sudo service opendkim restart
           sudo service postfix restart
+
 
       - name: Echo DNS records to add at Namecheap (copy/paste)
         run: |
@@ -196,3 +213,4 @@ jobs:
           sudo tail -n 400 /var/log/mail.log || true
           echo "---- syslog (postfix lines) ----"
           sudo tail -n 500 /var/log/syslog | grep -i -E 'postfix|smtp|opendkim' || true
+
