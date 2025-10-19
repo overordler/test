@@ -73,8 +73,13 @@ jobs:
           pushd "/etc/opendkim/keys/${DOMAIN}"
           sudo opendkim-genkey -s "${DKIM_SELECTOR}" -d "${DOMAIN}"
           sudo chown opendkim:opendkim "${DKIM_SELECTOR}.private"
-          # Extract public key (p=) without quotes/semicolons/newlines
-          DKIM_P="$(awk -F'p=' '/p=/{print $2}' "${DKIM_SELECTOR}.txt" | tr -d '\"; \n\r')"
+          # allow non-root to read the public TXT; keep private key tight
+          sudo chmod 600 "${DKIM_SELECTOR}.private"
+          sudo chmod 644 "${DKIM_SELECTOR}.txt"
+
+          # Extract public key (p=) safely with sudo and sanitize
+          DKIM_P="$(sudo awk -F 'p=' '/p=/{print $2}' "${DKIM_SELECTOR}.txt" | tr -d '\";[:space:]')"
+          # stash for later step (source /tmp/dkim_env)
           echo "DKIM_P=${DKIM_P}" | sudo tee /tmp/dkim_env >/dev/null
           popd
 
