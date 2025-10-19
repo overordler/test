@@ -1,0 +1,99 @@
+name: CI
+on:
+  push:
+  pull_request:
+  repository_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      DOMAIN: ${{ vars.DOMAIN || 'astronsys.com' }}
+      HOSTNAME_FQDN: ${{ vars.HOSTNAME_FQDN || format('mail.{0}', vars.DOMAIN || 'astronsys.com') }}
+      FROM_ADDR: ${{ vars.FROM_ADDR || format('no-reply@{0}', vars.DOMAIN || 'astronsys.com') }}
+      FROM_NAME: ${{ vars.FROM_NAME || 'GH Postfix Test' }}
+      RECIPIENT_EMAIL: "admin@cats-cocoon.org"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show egress IP
+        run: curl -s ifconfig.me || curl -s https://api.ipify.org
+
+      - name: Install Postfix + tools (non-interactive)
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euxo pipefail
+          echo "Using DOMAIN=${DOMAIN}"
+          echo "Using HOSTNAME_FQDN=${HOSTNAME_FQDN}"
+          sudo debconf-set-selections <<EOF
+          postfix postfix/mailname string ${DOMAIN}
+          postfix postfix/main_mailer_type select Internet Site
+          EOF
+          sudo apt-get update
+          sudo apt-get install -y postfix mailutils ca-certificates netcat-openbsd rsyslog
+
+          # Minimal Postfix: direct MX on port 25
+          sudo postconf -e "myhostname = ${HOSTNAME_FQDN}"
+          sudo postconf -e "myorigin = ${DOMAIN}"
+          sudo postconf -e "inet_interfaces = loopback-only"
+          sudo postconf -e "inet_protocols = ipv4"
+          sudo postconf -e "relayhost ="
+          sudo postconf -e "mydestination ="
+          sudo postconf -e "local_recipient_maps ="
+          sudo postconf -e "mynetworks = 127.0.0.0/8"
+          sudo postconf -e "smtpd_recipient_restrictions = permit_mynetworks,reject_unauth_destination"
+          sudo postconf -e "smtp_use_tls = yes"
+          sudo postconf -e "smtp_tls_security_level = may"
+          sudo postconf -e "smtp_tls_loglevel = 1"
+          sudo postconf -e "smtp_tls_CAfile = /etc/ssl/certs/ca-certificates.crt"
+          sudo postconf -e "smtp_helo_name = ${HOSTNAME_FQDN}"
+
+          # Enable mail logs
+          if ! grep -q "Postfix mail logs" /etc/rsyslog.d/50-default.conf; then
+            sudo bash -c 'cat >>/etc/rsyslog.d/50-default.conf' <<'EOF'
+          # --- Postfix mail logs ---
+          mail.info                      -/var/log/mail.log
+          mail.warn                      -/var/log/mail.warn
+          mail.err                       /var/log/mail.err
+          EOF
+          fi
+          sudo service rsyslog restart || sudo service rsyslog start || true
+          sudo service postfix restart
+
+      - name: Test TCP connectivity to port 25 (Gmail MX)
+        run: |
+          set -euxo pipefail
+          nc -vz gmail-smtp-in.l.google.com 25 || echo "Port 25 may be blocked"
+
+      - name: Send test email to inbox
+        if: env.RECIPIENT_EMAIL != ''
+        run: |
+          set -euxo pipefail
+          TS="$(date -u +%FT%TZ)"
+          MSGID="$(uuidgen)@${DOMAIN}"
+          {
+            echo "Subject: GH Actions Postfix test ${TS}"
+            echo "From: ${FROM_NAME} <${FROM_ADDR}>"
+            echo "To: <${RECIPIENT_EMAIL}>"
+            echo "Message-ID: <${MSGID}>"
+            echo "Date: $(date -R)"
+            echo "MIME-Version: 1.0"
+            echo "Content-Type: text/plain; charset=UTF-8"
+            echo
+            echo "Hello! This is a Postfix port-25 test sent from GitHub Actions at ${TS}."
+            echo "Message-ID: <${MSGID}>"
+          } | /usr/sbin/sendmail -v "${RECIPIENT_EMAIL}" || true
+
+          # Give the queue a nudge and a moment
+          postqueue -f || true
+          sleep 3
+
+      - name: Show Postfix config
+        run: postconf -n
+
+      - name: Show mail logs
+        run: |
+          sudo tail -n 300 /var/log/mail.log || true
+          echo "---- syslog (postfix lines) ----"
+          sudo tail -n 400 /var/log/syslog | grep -i -E 'postfix|smtp' || true
