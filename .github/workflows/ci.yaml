@@ -12,7 +12,7 @@ jobs:
       HOSTNAME_FQDN: ${{ vars.HOSTNAME_FQDN || format('mail.{0}', vars.DOMAIN || 'astronsys.com') }}
       FROM_ADDR: ${{ vars.FROM_ADDR || format('no-reply@{0}', vars.DOMAIN || 'astronsys.com') }}
       FROM_NAME: ${{ vars.FROM_NAME || 'GH Postfix Test' }}
-      RECIPIENT_EMAIL: "admin@cats-cocoon.org"
+      RECIPIENT_EMAIL: "bourichi.taha@outlook.com"
     steps:
       - uses: actions/checkout@v4
 
@@ -97,3 +97,4 @@ jobs:
           sudo tail -n 300 /var/log/mail.log || true
           echo "---- syslog (postfix lines) ----"
           sudo tail -n 400 /var/log/syslog | grep -i -E 'postfix|smtp' || true
+
