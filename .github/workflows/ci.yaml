@@ -12,28 +12,36 @@ jobs:
       HOSTNAME_FQDN: ${{ vars.HOSTNAME_FQDN || format('mail.{0}', vars.DOMAIN || 'astronsys.com') }}
       FROM_ADDR: ${{ vars.FROM_ADDR || format('no-reply@{0}', vars.DOMAIN || 'astronsys.com') }}
       FROM_NAME: ${{ vars.FROM_NAME || 'GH Postfix Test' }}
-      RECIPIENT_EMAIL: "bourichi.taha@outlook.com"
+      RECIPIENT_EMAIL: "bourichi.taha@gmail.com"
+      DKIM_SELECTOR: gh2025
     steps:
       - uses: actions/checkout@v4
 
       - name: Show egress IP
-        run: curl -s ifconfig.me || curl -s https://api.ipify.org
+        id: ip
+        run: |
+          set -e
+          IP="$(curl -s ifconfig.me || curl -s https://api.ipify.org)"
+          echo "ip=$IP" >> "$GITHUB_OUTPUT"
+          echo "Egress IP: $IP"
 
-      - name: Install Postfix + tools (non-interactive)
+      - name: Install Postfix + OpenDKIM (non-interactive)
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
           set -euxo pipefail
           echo "Using DOMAIN=${DOMAIN}"
           echo "Using HOSTNAME_FQDN=${HOSTNAME_FQDN}"
+
           sudo debconf-set-selections <<EOF
           postfix postfix/mailname string ${DOMAIN}
           postfix postfix/main_mailer_type select Internet Site
           EOF
-          sudo apt-get update
-          sudo apt-get install -y postfix mailutils ca-certificates netcat-openbsd rsyslog
 
-          # Minimal Postfix: direct MX on port 25
+          sudo apt-get update
+          sudo apt-get install -y postfix mailutils ca-certificates netcat-openbsd rsyslog opendkim opendkim-tools
+
+          # Postfix: direct MX on port 25
           sudo postconf -e "myhostname = ${HOSTNAME_FQDN}"
           sudo postconf -e "myorigin = ${DOMAIN}"
           sudo postconf -e "inet_interfaces = loopback-only"
@@ -59,7 +67,95 @@ jobs:
           EOF
           fi
           sudo service rsyslog restart || sudo service rsyslog start || true
+
+          # DKIM keypair (selector from env)
+          sudo mkdir -p "/etc/opendkim/keys/${DOMAIN}"
+          pushd "/etc/opendkim/keys/${DOMAIN}"
+          sudo opendkim-genkey -s "${DKIM_SELECTOR}" -d "${DOMAIN}"
+          sudo chown opendkim:opendkim "${DKIM_SELECTOR}.private"
+          # Extract public key (p=) without quotes/semicolons/newlines
+          DKIM_P="$(awk -F'p=' '/p=/{print $2}' "${DKIM_SELECTOR}.txt" | tr -d '\"; \n\r')"
+          echo "DKIM_P=${DKIM_P}" | sudo tee /tmp/dkim_env >/dev/null
+          popd
+
+          # Hook OpenDKIM into Postfix
+          sudo bash -c 'cat >/etc/opendkim.conf' <<'EOF'
+          Syslog                  yes
+          UMask                   002
+          Mode                    s
+          Canonicalization        relaxed/simple
+          SubDomains              no
+          OversignHeaders         From
+          AutoRestart             yes
+          AutoRestartRate         10/1h
+          Socket                  inet:8891@127.0.0.1
+          KeyTable                /etc/opendkim/KeyTable
+          SigningTable            /etc/opendkim/SigningTable
+          ExternalIgnoreList      /etc/opendkim/TrustedHosts
+          InternalHosts           /etc/opendkim/TrustedHosts
+          EOF
+
+          echo "${DKIM_SELECTOR}._domainkey.${DOMAIN} ${DOMAIN}:${DKIM_SELECTOR}:/etc/opendkim/keys/${DOMAIN}/${DKIM_SELECTOR}.private" | sudo tee /etc/opendkim/KeyTable
+          echo "*@${DOMAIN} ${DKIM_SELECTOR}._domainkey.${DOMAIN}" | sudo tee /etc/opendkim/SigningTable
+          printf "127.0.0.1\n::1\nlocalhost\n" | sudo tee /etc/opendkim/TrustedHosts
+
+          sudo postconf -e "milter_default_action = accept"
+          sudo postconf -e "milter_protocol = 6"
+          sudo postconf -e "smtpd_milters = inet:127.0.0.1:8891"
+          sudo postconf -e "non_smtpd_milters = inet:127.0.0.1:8891"
+
+          sudo service opendkim restart
           sudo service postfix restart
+
+      - name: Echo DNS records to add at Namecheap (copy/paste)
+        run: |
+          set -e
+          source /tmp/dkim_env
+          EGRESS_IP="${{ steps.ip.outputs.ip }}"
+          DOMAIN="${DOMAIN}"
+          HOST="${HOSTNAME_FQDN}"
+          SEL="${DKIM_SELECTOR}"
+
+          echo ""
+          echo "==================== DNS RECORDS TO ADD (Namecheap) ===================="
+          echo ""
+          echo "1) A record (mail host -> current runner IP)"
+          echo "   Type: A"
+          echo "   Host: mail"
+          echo "   Value: ${EGRESS_IP}"
+          echo "   TTL: 300"
+          echo ""
+          echo "2) MX record (domain -> mail host)"
+          echo "   Type: MX"
+          echo "   Host: @"
+          echo "   Value: ${HOST}."
+          echo "   Priority: 10"
+          echo "   TTL: 300"
+          echo ""
+          echo "3) SPF record (TXT at root)"
+          echo "   Type: TXT"
+          echo "   Host: @"
+          echo "   Value: v=spf1 ip4:${EGRESS_IP} a:${HOST} ~all"
+          echo "   TTL: 300"
+          echo ""
+          echo "4) DKIM record (TXT at selector)"
+          echo "   Type: TXT"
+          echo "   Host: ${SEL}._domainkey"
+          echo "   Value: v=DKIM1; k=rsa; p=${DKIM_P}"
+          echo "   TTL: 300"
+          echo ""
+          echo "5) DMARC record (monitor mode)"
+          echo "   Type: TXT"
+          echo "   Host: _dmarc"
+          echo "   Value: v=DMARC1; p=none; rua=mailto:dmarc@${DOMAIN}; ruf=mailto:dmarc@${DOMAIN}; fo=1; adkim=s; aspf=s; pct=100"
+          echo "   TTL: 300"
+          echo ""
+          echo "-----------------------------------------------------------------------"
+          echo "Reminder: This runner IP (${EGRESS_IP}) is ephemeral. For real sending,"
+          echo "use a static IP with matching reverse DNS (PTR) pointing to ${HOST}."
+          echo "After adding records, allow DNS to propagate, then re-run the test."
+          echo "======================================================================="
+          echo ""
 
       - name: Test TCP connectivity to port 25 (Gmail MX)
         run: |
@@ -81,11 +177,9 @@ jobs:
             echo "MIME-Version: 1.0"
             echo "Content-Type: text/plain; charset=UTF-8"
             echo
-            echo "Hello! This is a Postfix port-25 test sent from GitHub Actions at ${TS}."
+            echo "Hello! DKIM selector ${DKIM_SELECTOR}; sent at ${TS}."
             echo "Message-ID: <${MSGID}>"
           } | /usr/sbin/sendmail -v "${RECIPIENT_EMAIL}" || true
-
-          # Give the queue a nudge and a moment
           postqueue -f || true
           sleep 3
 
@@ -94,7 +188,6 @@ jobs:
 
       - name: Show mail logs
         run: |
-          sudo tail -n 300 /var/log/mail.log || true
+          sudo tail -n 400 /var/log/mail.log || true
           echo "---- syslog (postfix lines) ----"
-          sudo tail -n 400 /var/log/syslog | grep -i -E 'postfix|smtp' || true
-
+          sudo tail -n 500 /var/log/syslog | grep -i -E 'postfix|smtp|opendkim' || true
